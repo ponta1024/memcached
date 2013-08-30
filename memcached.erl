@@ -1,5 +1,5 @@
 -module(memcached).
--export([start_server/0, launch_ets/0, launch_listen/1, launch_supervisor/1, acceptor/2]).
+-export([start_server/0, launch_ets/0, launch_listen/1, launch_supervisor/1, acceptor/2, mutex_init/0]).
 -define(PORT, 11211).
 -define(NUM_WORKERS, 128).
 
@@ -7,13 +7,15 @@
 start_server() ->
     spawn(?MODULE, launch_ets, []),
     spawn(?MODULE, launch_listen, [self()]),
-    receive ListenSocket -> ok end,
+    register(mutex, spawn(?MODULE, mutex_init, [])),
+    receive {listen_socket, ListenSocket} -> ok end,
     SuperPid = spawn(?MODULE, launch_supervisor,[ListenSocket]),
     launch_workers(?NUM_WORKERS, SuperPid,  ListenSocket).
 
 launch_ets() ->
     ets:new(kvs, [public, named_table, {write_concurrency, true}, {read_concurrency, true}]),
-    receive Message -> io:format( "ets exiting...~p~n",[Message]) end.
+    receive Message -> io:format( "launch_ets received a message: ~p~n",[Message]) end,
+    launch_ets().
 
 launch_listen(Pid) ->
     {ok, ListenSocket} = gen_tcp:listen(?PORT, 
@@ -23,15 +25,42 @@ launch_listen(Pid) ->
                                          {reuseaddr, true}, 
                                          {backlog, 512}, 
                                          {nodelay, true}]),
-    Pid ! ListenSocket,
-    receive Message -> io:format( "listen exiting...~p~n",[Message]) end.
+    Pid ! {listen_socket, ListenSocket},
+    receive Message -> io:format( "launch_listen received a message: ~p~n",[Message]) end,
+    launch_listen(Pid).
+
+mutex_init() ->
+    free().
+
+wait() ->
+    mutex ! {wait, self()},
+    receive ok ->
+            ok end. 
+
+signal() ->
+    mutex ! {signal, self()},
+    ok. 
+
+free() ->
+    receive 
+        {wait, Pid} ->
+            Pid ! ok,
+            busy(Pid)
+    end. 
+
+busy(Pid) -> 
+    receive 
+        {signal, Pid} -> 
+            free() 
+    end.
+
 
 launch_supervisor(ListenSocket) ->
     process_flag(trap_exit, true),
     receive 
         Error -> 
             io:format("acceptor died (~p) and respawned~n", [Error]),
-            spawn(?MODULE, acceptor, [ListenSocket, self()])
+            spawn_link(?MODULE, acceptor, [ListenSocket, self()])
     end,
     launch_supervisor(ListenSocket).
 
@@ -48,7 +77,7 @@ acceptor(ListenSocket, SuperPid) ->
             recv_loop(WorkerSocket),
             acceptor(ListenSocket, SuperPid);
         {error, Reason} ->
-            io:format("listen: ~s~n", [Reason]),
+            io:format("accept: ~s~n", [Reason]),
             acceptor(ListenSocket, SuperPid)
     end.
 
@@ -102,6 +131,7 @@ delete_command(Socket, Key) ->
     end.
 
 incr_command(Socket, Key, Param, Polarity) ->
+    wait(),
     case ets:lookup(kvs, Key) of
         [{Key, Value}] ->
             try binary_to_integer(Value) of
@@ -110,16 +140,20 @@ incr_command(Socket, Key, Param, Polarity) ->
                         Parameter = binary_to_integer(Param),
                         NewValue = CurrentValue + Parameter * Polarity,
                         true = ets:insert(kvs, [{Key, integer_to_binary(NewValue)}]),
+                        signal(),
                         ok = gen_tcp:send(Socket, io_lib:format("~w\r\n", [NewValue]))
                     catch
                         error:badarg ->
+                            signal(),
                             ok = gen_tcp:send(Socket, <<"CLIENT_ERROR invalid numeric delta argument\r\n">>)
                     end
             catch
                 error:badarg ->
+                    signal(),
                     ok = gen_tcp:send(Socket, <<"CLIENT_ERROR cannot increment or decrement non-numeric value\r\n">>)
             end;
         [] ->
+            signal(),
             ok = gen_tcp:send(Socket, <<"NOT_FOUND\r\n">>)
     end.
 
